@@ -2,9 +2,9 @@ import "regenerator-runtime/runtime";
 
 import { memoize } from "lodash";
 import * as React from "react";
-import { render } from "react-dom";
+import { createRoot } from "react-dom/client";
 import { Provider } from "react-redux";
-import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { createBrowserRouter, createHashRouter, RouterProvider } from "react-router-dom";
 
 import NotificationServiceWeb from "./services/NotificationServiceWeb";
 import ApplicationInfoServiceWeb from "./services/ApplicationInfoServiceWeb";
@@ -23,36 +23,40 @@ import { createReduxStore } from "../../core/state";
 import "../../core/styles/global.css";
 import styles from "./src.module.css";
 
+// Check if running in Electron (BioPRISM context)
+const isElectron = typeof window !== "undefined" && window.location.protocol === "file:";
+
 const APP_ID = "biofile-finder";
 
-const router = createBrowserRouter(
-    [
-        {
-            element: <Layout />,
-            children: [
-                {
-                    path: "/",
-                    element: <Home />, // Splash page
-                },
-                {
-                    path: "learn",
-                    element: <Learn />,
-                },
-                {
-                    path: "app",
-                    element: <FmsFileExplorer className={styles.app} />,
-                },
-                {
-                    path: "datasets",
-                    element: <OpenSourceDatasets />,
-                },
-            ],
-        },
-    ],
+// Define routes
+const routes = [
     {
-        basename: "",
-    }
-);
+        element: <Layout />,
+        children: [
+            {
+                path: "/",
+                element: <Home />, // Splash page
+            },
+            {
+                path: "learn",
+                element: <Learn />,
+            },
+            {
+                path: "app",
+                element: <FmsFileExplorer className={styles.app} />,
+            },
+            {
+                path: "datasets",
+                element: <OpenSourceDatasets />,
+            },
+        ],
+    },
+];
+
+// Use HashRouter for Electron (BioPRISM), BrowserRouter for web
+const router = isElectron
+    ? createHashRouter(routes)
+    : createBrowserRouter(routes, { basename: "" });
 
 async function asyncRender() {
     const databaseService = new DatabaseServiceWeb();
@@ -69,14 +73,15 @@ async function asyncRender() {
         fileDownloadService: new FileDownloadServiceWeb(),
     }));
     const store = createReduxStore({
-        isOnWeb: true,
+        isOnWeb: !isElectron, // False when in BioPRISM/Electron
         platformDependentServices: collectPlatformDependentServices(),
     });
-    render(
+    
+    const root = createRoot(document.getElementById(APP_ID)!);
+    root.render(
         <Provider store={store}>
             <RouterProvider router={router} />
-        </Provider>,
-        document.getElementById(APP_ID)
+        </Provider>
     );
 
     try {

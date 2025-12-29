@@ -95,12 +95,19 @@ module.exports = ({ analyze, production } = {}) => ({
     output: {
         path: path.resolve(__dirname, "../", "dist"),
         filename: "[name].[chunkhash].js",
+        publicPath: "./", // Use relative paths for Electron file:// loading
     },
     plugins: getPluginsByEnv(production, analyze),
     resolve: {
         extensions: [".ts", ".tsx", ".js", ".jsx", ".json", ".png"],
         mainFields: ["module", "main"],
         symlinks: false,
+        alias: {
+            // Force single React instance to avoid hooks errors
+            react: path.resolve(__dirname, "../node_modules/react"),
+            "react-dom": path.resolve(__dirname, "../node_modules/react-dom"),
+            "react-redux": path.resolve(__dirname, "../node_modules/react-redux"),
+        },
     },
     stats: analyze ? "none" : stats,
 });

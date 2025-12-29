@@ -1,39 +1,102 @@
 {
 
   "name": "biofile-finder",
+
   "description": "A web application for organizing that data, and provide simple hooks for incorporating that data into both programmatic and non-programmatic workflows",
+
   "main": "src/index.tsx",
+
   "scripts": {
+
     "build": "webpack --config ./webpack/webpack.config.js --env production",
+
     "clean": "git clean -Xfd -e \"!node_modules\"",
+
     "packageForPublish": "node ./scripts/package-for-publish.js",
+
     "start": "webpack-dev-server --config ./webpack/webpack.config.js"
+
   },
+
   "repository": {
+
     "type": "git",
+
     "url": "https://github.com/AllenInstitute/biofile-finder"
+
   },
+
   "author": "Allen Institute for Cell Science",
+
   "license": "SEE LICENSE IN LICENSE.txt",
+
   "devDependencies": {
+
     "babel-loader": "8.2.x",
+
     "clean-webpack-plugin": "4.x",
+
     "css-loader": "6.x",
+
     "dotenv-webpack": "7.x",
+
     "fork-ts-checker-webpack-plugin": "6.x",
+
     "html-webpack-plugin": "5.x",
+
     "mini-css-extract-plugin": "2.x",
+
     "postcss-loader": "6.x",
+
     "postcss-preset-env": "7.x",
+
     "react-svg-loader": "^3.0.3",
+
     "webpack": "5.x",
+
     "webpack-bundle-analyzer": "4.x",
+
     "webpack-cli": "4.x",
+
     "webpack-dev-server": "4.x"
+
   },
+
   "dependencies": {
+
+    "@aics/redux-utils": "^0.6.0",
+
+    "@babel/runtime": "^7.28.4",
+
     "@duckdb/duckdb-wasm": "^1.30",
+
+    "@fluentui/react": "^8.125.3",
+
+    "classnames": "^2.5.1",
+
+    "lodash": "^4.17.21",
+
+    "moment": "^2.30.1",
+
+    "normalize.css": "^8.0.1",
+
+    "react": "^19.2.3",
+
+    "react-dom": "^19.2.3",
+
+    "react-redux": "^9.2.0",
+
     "react-router-dom": "^6.23.1",
-    "regenerator-runtime": "0.13.x"
+
+    "redux": "^5.0.1",
+
+    "redux-saga": "^1.4.2",
+
+    "regenerator-runtime": "0.13.x",
+
+    "string-natural-compare": "^3.0.1"
+
   }
+
 }
+
