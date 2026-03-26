@@ -10,6 +10,7 @@ import { interaction, metadata, selection } from "../../state";
 interface Props {
     dataSources: Source[];
     sourceMetadata?: Source;
+    sourceProvenance?: Source;
 }
 
 /**
@@ -74,9 +75,29 @@ export default function QueryDataSource(props: Props) {
                     text: "New data source",
                     iconProps: { iconName: "NewFolder" },
                     onClick: () => {
-                        dispatch(interaction.actions.promptForDataSource({ query: selectedQuery }));
+                        dispatch(
+                            interaction.actions.promptForDataSource({
+                                query: selectedQuery,
+                                source: selectedDataSources[0],
+                            })
+                        );
                     },
                 },
+                // TODO: Hide this for now until we have better docs for explaining this
+                // Temporary menu item for adding provenance data
+                // {
+                //     key: "New Provenance Data Source",
+                //     text: "New provenance data source",
+                //     onClick: () => {
+                //         dispatch(
+                //             interaction.actions.promptForDataSource({
+                //                 query: selectedQuery,
+                //                 source: selectedDataSources[0],
+                //                 sourceType: DataSourceType.provenance,
+                //             })
+                //         );
+                //     },
+                // },
             ]}
             rows={[
                 ...props.dataSources.map((dataSource) => ({
@@ -88,6 +109,14 @@ export default function QueryDataSource(props: Props) {
                           {
                               id: "sourceMetadata",
                               title: `described by: ${props.sourceMetadata.name}`,
+                          },
+                      ]
+                    : []),
+                ...(props.sourceProvenance
+                    ? [
+                          {
+                              id: "sourceProvenance",
+                              title: `provenance from: ${props.sourceProvenance.name}`,
                           },
                       ]
                     : []),

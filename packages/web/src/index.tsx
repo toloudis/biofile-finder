@@ -8,10 +8,11 @@ import { createBrowserRouter, createHashRouter, RouterProvider } from "react-rou
 
 import NotificationServiceWeb from "./services/NotificationServiceWeb";
 import ApplicationInfoServiceWeb from "./services/ApplicationInfoServiceWeb";
-import ExecutionEnvServiceWeb from "./services/ExecutionEnvServiceWeb";
 import DatabaseServiceWeb from "./services/DatabaseServiceWeb";
+import ExecutionEnvServiceWeb from "./services/ExecutionEnvServiceWeb";
 import FileViewerServiceWeb from "./services/FileViewerServiceWeb";
 import FileDownloadServiceWeb from "./services/FileDownloadServiceWeb";
+import ErrorPage from "./components/ErrorPage";
 import Learn from "./components/Learn";
 import Home from "./components/Home";
 import Layout from "./components/Layout";
@@ -22,6 +23,7 @@ import { createReduxStore } from "../../core/state";
 
 import "../../core/styles/global.css";
 import styles from "./src.module.css";
+import S3StorageService from "../../core/services/S3StorageService";
 
 // Check if running in Electron (BioPRISM context)
 const isElectron = typeof window !== "undefined" && window.location.protocol === "file:";
@@ -32,6 +34,7 @@ const APP_ID = "biofile-finder";
 const routes = [
     {
         element: <Layout />,
+        ErrorBoundary: ErrorPage,
         children: [
             {
                 path: "/",
@@ -70,7 +73,7 @@ async function asyncRender() {
         executionEnvService: new ExecutionEnvServiceWeb(),
         applicationInfoService: new ApplicationInfoServiceWeb(),
         fileViewerService: new FileViewerServiceWeb(),
-        fileDownloadService: new FileDownloadServiceWeb(),
+        fileDownloadService: new FileDownloadServiceWeb(new S3StorageService()),
     }));
     const store = createReduxStore({
         isOnWeb: !isElectron, // False when in BioPRISM/Electron

@@ -61,6 +61,7 @@ export const TOP_LEVEL_FILE_ANNOTATIONS = [
 export const TOP_LEVEL_FILE_ANNOTATION_NAMES = TOP_LEVEL_FILE_ANNOTATIONS.map((a) => a.name);
 
 export const AICS_FMS_DATA_SOURCE_NAME = "AICS FMS";
+export const HIDDEN_UID_ANNOTATION = "hidden_bff_uid";
 
 export enum FESBaseUrl {
     LOCALHOST = "http://localhost:9081",
@@ -98,6 +99,13 @@ export enum CellFeatureExplorerBaseUrl {
     STAGING = "http://dev-aics-dtp-001.corp.alleninstitute.org/cell-feature-explorer/dist",
     PRODUCTION = "http://dev-aics-dtp-001.corp.alleninstitute.org/cell-feature-explorer/dist",
     TEST = "http://dev-aics-dtp-001.corp.alleninstitute.org/cell-feature-explorer/dist",
+}
+
+export enum VolEBaseUrl {
+    LOCALHOST = "http://localhost:9020/viewer",
+    STAGING = "https://staging.volumeviewer.allencell.org/viewer",
+    PRODUCTION = "https://vole.allencell.org/viewer",
+    TEST = "https://staging.volumeviewer.allencell.org/viewer",
 }
 
 export enum TemporaryFileServiceBaseUrl {

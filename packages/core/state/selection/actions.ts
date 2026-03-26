@@ -667,9 +667,28 @@ export function changeSourceMetadata(source?: Source): ChangeSourceMetadataActio
 }
 
 /**
+ * CHANGE_PROVENANCE_SOURCE
+ *
+ * Intention to update the source file supplying provenance info about the selected data sources
+ */
+export const CHANGE_PROVENANCE_SOURCE = makeConstant(STATE_BRANCH_NAME, "change-provenance-source");
+
+export interface ChangeProvenanceSource {
+    payload?: Source;
+    type: string;
+}
+
+export function changeProvenanceSource(source?: Source): ChangeProvenanceSource {
+    return {
+        payload: source,
+        type: CHANGE_PROVENANCE_SOURCE,
+    };
+}
+
+/**
  * SELECT_TUTORIAL
  *
- * Intention to update the current tutorial step displayed to users
+ * Intention to update the current tutorial topic displayed to users
  */
 export const SELECT_TUTORIAL = makeConstant(STATE_BRANCH_NAME, "select-tutorial");
 
@@ -682,6 +701,23 @@ export function selectTutorial(tutorial?: Tutorial): SelectTutorial {
     return {
         payload: tutorial,
         type: SELECT_TUTORIAL,
+    };
+}
+
+/**
+ * RUN_ALL_TUTORIALS
+ *
+ * Intention to run all tutorial topics in sequence
+ */
+export const RUN_ALL_TUTORIALS = makeConstant(STATE_BRANCH_NAME, "run-all-tutorials");
+
+export interface RunAllTutorials {
+    type: string;
+}
+
+export function runAllTutorials(): RunAllTutorials {
+    return {
+        type: RUN_ALL_TUTORIALS,
     };
 }
 

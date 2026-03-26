@@ -3,20 +3,21 @@ import { isEmpty } from "lodash";
 import * as React from "react";
 import { useDispatch, useSelector } from "react-redux";
 
+import useOpenInCfe from "./useOpenInCfe";
 import AnnotationName from "../../entity/Annotation/AnnotationName";
 import FileDetail from "../../entity/FileDetail";
 import FileFilter from "../../entity/FileFilter";
 import { interaction, metadata, selection } from "../../state";
+import { getVolEBaseUrl } from "../../state/interaction/selectors";
 
 import styles from "./useOpenWithMenuItems.module.css";
-import useOpenInCfe from "./useOpenInCfe";
-import useRemoteFileUpload from "../useRemoteFileUpload";
 
 const ONE_MEGABYTE = 1024 * 1024;
 
 enum AppKeys {
     AGAVE = "agave",
     BROWSER = "browser",
+    FIJI = "fiji",
     NEUROGLANCER = "neuroglancer",
     SIMULARIUM = "simularium",
     VALIDATOR = "validator",
@@ -28,6 +29,7 @@ enum AppKeys {
 interface Apps {
     [AppKeys.AGAVE]: IContextualMenuItem;
     [AppKeys.BROWSER]: IContextualMenuItem;
+    [AppKeys.FIJI]: IContextualMenuItem;
     [AppKeys.NEUROGLANCER]: IContextualMenuItem;
     [AppKeys.SIMULARIUM]: IContextualMenuItem;
     [AppKeys.VALIDATOR]: IContextualMenuItem;
@@ -38,6 +40,8 @@ interface Apps {
 
 type AppOptions = {
     openInCfe: () => void;
+    openInVolE: () => void;
+    openInFiji: () => void;
 };
 
 const SUPPORTED_APPS_HEADER = {
@@ -60,7 +64,6 @@ const APPS = (
 ): Apps => ({
     [AppKeys.AGAVE]: {
         key: AppKeys.AGAVE,
-        // TODO: Upgrade styling here
         className: styles.desktopMenuItem,
         text: "AGAVE",
         title: "Open files with AGAVE v1.7.2+",
@@ -102,6 +105,38 @@ const APPS = (
                 <>
                     {defaultRenders.renderItemName(props)}
                     <span className={styles.secondaryText}>Web</span>
+                </>
+            );
+        },
+    } as IContextualMenuItem,
+    [AppKeys.FIJI]: {
+        key: AppKeys.FIJI,
+        className: styles.desktopMenuItem,
+        text: "FIJI",
+        title: "Open files with FIJI (may require updating FIJI)",
+        onClick: options?.openInFiji,
+        disabled: !fileDetails?.path,
+        target: "_blank",
+        onRenderContent(props, defaultRenders) {
+            return (
+                <>
+                    {defaultRenders.renderItemName(props)}
+                    <a
+                        className={styles.viewLink}
+                        href="https://imagej.net/software/fiji/downloads"
+                        rel="noreferrer"
+                        target="_blank"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <DefaultButton
+                            className={styles.infoButton}
+                            title="Get info or download to enable use"
+                        >
+                            Info
+                            <Icon iconName="OpenInNewWindow" />
+                        </DefaultButton>
+                    </a>
+                    <span className={styles.secondaryText}>| Desktop</span>
                 </>
             );
         },
@@ -160,7 +195,7 @@ const APPS = (
         key: AppKeys.VOLE,
         text: "Vol-E",
         title: `Open files with Vol-E`,
-        href: `https://volumeviewer.allencell.org/viewer?url=${fileDetails?.path}/`,
+        onClick: options?.openInVolE,
         disabled: !fileDetails?.path,
         target: "_blank",
         onRenderContent(props, defaultRenders) {
@@ -205,6 +240,12 @@ const APPS = (
     } as IContextualMenuItem,
 });
 
+type VolEMessage = {
+    scenes?: string[];
+    meta: Record<string, Record<string, unknown>>;
+    sceneIndex?: number;
+};
+
 function getSupportedApps(
     apps: Apps,
     isSmallFile: boolean,
@@ -231,7 +272,7 @@ function getSupportedApps(
         case "svg":
         case "txt":
         case "xml":
-            return [apps.browser];
+            return isLikelyLocalFile ? [apps.fiji, apps.browser] : [apps.browser, apps.fiji];
         case "simularium":
             return [apps.simularium];
         case "dcm":
@@ -240,7 +281,9 @@ function getSupportedApps(
             return [apps.neuroglancer];
         case "tif":
         case "tiff":
-            return isSmallFile ? [apps.agave, apps.vole] : [apps.agave];
+            return isLikelyLocalFile || !isSmallFile
+                ? [apps.fiji, apps.agave]
+                : [apps.fiji, apps.agave, apps.vole];
         case "zarr":
         case "": // No extension
             return isLikelyLocalFile
@@ -260,11 +303,61 @@ function getSupportedApps(
             : [apps.vole, apps.neuroglancer, apps.agave, apps.validator];
     }
 
-    return [];
+    return [apps.fiji];
 }
 
-function getFileExtension(fileDetails: FileDetail): string {
-    return fileDetails.path.slice(fileDetails.path.lastIndexOf(".") + 1).toLowerCase();
+function getFileExtension({ path }: FileDetail): string {
+    const trimmedPath = path.endsWith("/") ? path.slice(0, -1) : path;
+    const filename = trimmedPath.slice(trimmedPath.lastIndexOf("/") + 1);
+    const extensionIndex = filename.lastIndexOf(".");
+    if (extensionIndex === -1) {
+        return "";
+    }
+    return filename.slice(extensionIndex + 1).toLowerCase();
+}
+
+/**
+ * Vol-E uses certain reserved characters to delimit URLs.
+ * If the URLs also contain those characters, they ought to be escaped.
+ */
+function encodeVolEImageUrl(url: string): string {
+    return /[+ ,]/.test(url) ? encodeURIComponent(url) : url;
+}
+
+/**
+ * Opens a window at `openUrl`, then attempts to send the data in `entry` to it.
+ *
+ * This requires a bit of protocol to accomplish:
+ * 1. We add some query params to `openUrl` before opening: `msgorigin` is this site's origin for
+ *    validation, and `storageid` uniquely identifies the message we want to send.
+ * 2. *The opened window must check if these params are present* and post the value of `storageid`
+ *    back to us (via `window.opener`, validated using `msgorigin`) once it's loaded and ready.
+ * 3. Once we receive that message, we send over `entry`.
+ *
+ * This is currently only used by `openInVolE`, but is broken out into a separate function to
+ * emphasize that this protocol is both message- and receiver-agnostic, and could be used to send
+ * large bundles of data to other apps as well.
+ */
+function openWindowWithMessage(openUrl: URL, message: any): void {
+    if (message === undefined || message === null) {
+        window.open(openUrl);
+        return;
+    }
+
+    openUrl.searchParams.append("msgorigin", window.location.origin);
+
+    const handle = window.open(openUrl);
+    const loadHandler = (event: MessageEvent): void => {
+        if (event.origin !== openUrl.origin || event.source !== handle) {
+            return;
+        }
+        handle?.postMessage(message, openUrl.origin);
+        window.removeEventListener("message", loadHandler);
+    };
+
+    window.addEventListener("message", loadHandler);
+    // ensure handlers can't build up with repeated failed requests
+    window.setTimeout(() => window.removeEventListener("message", loadHandler), 60000);
 }
 
 export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMenuItem[] => {
@@ -274,15 +367,15 @@ export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMe
     const dispatch = useDispatch();
     const isOnWeb = useSelector(interaction.selectors.isOnWeb);
     const isAicsEmployee = useSelector(interaction.selectors.isAicsEmployee);
+    const s3StorageService = useSelector(interaction.selectors.getS3StorageService);
     const userSelectedApplications = useSelector(interaction.selectors.getUserSelectedApplications);
-    const { fileDownloadService, executionEnvService } = useSelector(
-        interaction.selectors.getPlatformDependentServices
-    );
+    const { executionEnvService } = useSelector(interaction.selectors.getPlatformDependentServices);
     const annotationNameToAnnotationMap = useSelector(
         metadata.selectors.getAnnotationNameToAnnotationMap
     );
     const loadBalancerBaseUrl = useSelector(interaction.selectors.getLoadBalancerBaseUrl);
     const fileService = useSelector(interaction.selectors.getFileService);
+    const volEBaseUrl = useSelector(getVolEBaseUrl);
 
     const fileSelection = useSelector(selection.selectors.getFileSelection);
     const annotationNames = React.useMemo(
@@ -290,14 +383,86 @@ export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMe
         [annotationNameToAnnotationMap]
     );
     const [isSmallFile, setIsSmallFile] = React.useState(false);
+    const [isMacOS, setIsMacOS] = React.useState(false);
 
-    const remoteServerConnection = useRemoteFileUpload();
-    const openInCfe = useOpenInCfe(
-        remoteServerConnection,
-        fileSelection,
-        annotationNames,
-        fileService
-    );
+    const openInCfe = useOpenInCfe(fileSelection, annotationNames, fileService);
+
+    const openInFiji = React.useCallback(async (): Promise<void> => {
+        if (!fileDetails) return;
+        let path = fileDetails.path;
+        // Attempt to format the URL as an https resource so FIJI has an easier time opening it
+        if (fileDetails.path.startsWith("s3")) {
+            path = (await s3StorageService.formatAsHttpResource(fileDetails.path)) || path;
+        }
+        const fijiUrl = `fiji://open/source?p=${path}`;
+        window.open(fijiUrl);
+    }, [fileDetails, s3StorageService]);
+
+    // custom hook this, like `useOpenInCfe`?
+    const openInVolE = React.useCallback(async (): Promise<void> => {
+        let details = await fileSelection.fetchAllDetails();
+        if (details.length > 1) {
+            // if the user has more than one file selected, try to filter out what Vol-E can't open
+            const filteredDetails = details.filter((detail) => {
+                const fileExt = getFileExtension(detail);
+                return ["", "zarr", "tiff", "tif"].includes(fileExt);
+            });
+            if (filteredDetails.length !== 0) {
+                details = filteredDetails;
+            }
+        }
+
+        const scenes: string[] = [];
+        const message: VolEMessage = { meta: {} };
+
+        for (const detail of details) {
+            const sceneMeta: Record<string, unknown> = {};
+            for (const annotation of detail.annotations) {
+                const isSingleValue = annotation.values.length === 1;
+                const value = isSingleValue ? annotation.values[0] : annotation.values;
+                sceneMeta[annotation.name] = value;
+            }
+            scenes.push(detail.path);
+            if (Object.keys(sceneMeta).length > 0) {
+                message.meta[detail.path] = sceneMeta;
+            }
+        }
+
+        const openUrl = new URL(volEBaseUrl);
+
+        // Start on the focused scene
+        const sceneIndex = details.findIndex((detail) => detail.path === fileDetails?.path);
+
+        // Prefer putting the image URLs directly in the query string for easy sharing, if the
+        // length of the URL would be reasonable
+        const includeUrls =
+            details.length < 5 ||
+            details.reduce((acc, detail) => acc + detail.path.length + 1, 0) <= 250;
+
+        if (includeUrls) {
+            // We can fit all the URLs we want!
+            const encodedURLs = details.map(({ path }) => encodeVolEImageUrl(path));
+            openUrl.searchParams.append("url", encodedURLs.join("+"));
+            if (sceneIndex > 0) {
+                openUrl.searchParams.append("scene", sceneIndex.toString());
+            }
+        } else {
+            // There are more scene URLs than we want to put in the full URL. We need to send them over as a message.
+            // Include only the URL of the focused scene, so the link is usable even if the message fails.
+            const initialImageUrl = details[Math.max(sceneIndex, 0)].path;
+            openUrl.searchParams.append("url", encodeVolEImageUrl(initialImageUrl));
+            message.scenes = scenes;
+            if (sceneIndex > 0) {
+                message.sceneIndex = sceneIndex;
+            }
+        }
+
+        if (includeUrls && Object.keys(message.meta).length === 0) {
+            window.open(openUrl);
+        } else {
+            openWindowWithMessage(openUrl, message);
+        }
+    }, [fileDetails, fileSelection, volEBaseUrl]);
 
     const plateLink = fileDetails?.getLinkToPlateUI(loadBalancerBaseUrl);
     const annotationNameToLinkMap = React.useMemo(
@@ -365,7 +530,7 @@ export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMe
         })
         .sort((a, b) => (a.text || "").localeCompare(b.text || ""));
 
-    const apps = APPS(fileDetails, { openInCfe });
+    const apps = APPS(fileDetails, { openInCfe, openInVolE, openInFiji });
 
     // Determine is the file is small or not asynchronously
     React.useEffect(() => {
@@ -374,7 +539,7 @@ export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMe
                 let fileSize = size;
                 if (!fileSize) {
                     try {
-                        fileSize = await fileDownloadService.getHttpObjectSize(path);
+                        fileSize = await s3StorageService.getCloudObjectSize(path);
                     } catch (_err) {
                         console.debug(
                             `Failed to get size of ${path}. Unable to determine if Vol-E is suitable viewer.`
@@ -387,9 +552,35 @@ export default (fileDetails?: FileDetail, filters?: FileFilter[]): IContextualMe
             }
         }
         determineFileSize();
-    }, [path, size, fileDownloadService, setIsSmallFile]);
+    }, [path, size, s3StorageService, setIsSmallFile]);
 
-    const supportedApps = [...getSupportedApps(apps, isSmallFile, fileDetails), ...userApps];
+    // Try to quickly check if user is on MacOS or not
+    React.useEffect(() => {
+        async function getIsMacOS() {
+            try {
+                // Typescript doesn't have support for this property yet
+                const userAgentData = (navigator as any).userAgentData;
+                if (userAgentData) {
+                    const ua = await userAgentData.getHighEntropyValues(["platform"]);
+                    return ua.platform === "macOS";
+                }
+
+                // Fallback
+                return navigator.platform.toUpperCase().includes("MAC");
+            } catch (e) {
+                console.error(
+                    "Unable to determine if user is on a MacOS. Assuming not, and disabling any MacOS specific features."
+                );
+                return false;
+            }
+        }
+        getIsMacOS().then(setIsMacOS);
+    }, []);
+
+    const supportedApps = [...getSupportedApps(apps, isSmallFile, fileDetails), ...userApps]
+        // TODO: This is a placeholder until FIJI finishes rolling out FIJI support across all
+        // platforms
+        .filter((app) => isMacOS || app.key !== AppKeys.FIJI);
     // Grab every other known app
     const unsupportedApps = Object.values(apps)
         .filter((app) => supportedApps.every((item) => item.key !== app.key))

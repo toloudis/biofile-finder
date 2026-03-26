@@ -10,10 +10,12 @@ import { get as _get, shuffle } from "lodash";
 import sinon from "sinon";
 
 import {
+    addDataSourceReloadError,
     addFileFilter,
     addQuery,
     changeDataSources,
     changeSourceMetadata,
+    changeProvenanceSource,
     decodeSearchParams,
     expandAllFileFolders,
     reorderAnnotationHierarchy,
@@ -23,6 +25,7 @@ import {
     selectFile,
     selectNearbyFile,
     ADD_DATASOURCE_RELOAD_ERROR,
+    ADD_QUERY,
     SET_ANNOTATION_HIERARCHY,
     SET_AVAILABLE_ANNOTATIONS,
     SET_FILE_FILTERS,
@@ -30,7 +33,6 @@ import {
     SET_OPEN_FILE_FOLDERS,
     SET_SORT_COLUMN,
     Query,
-    addDataSourceReloadError,
 } from "../actions";
 import { initialState, interaction } from "../../";
 import { FESBaseUrl } from "../../../constants";
@@ -700,8 +702,8 @@ describe("Selection logics", () => {
                 return Promise.reject("MockDatabaseService:saveQuery");
             }
 
-            public query(): Promise<{ [key: string]: string }[]> {
-                return Promise.reject("MockDatabaseService:query");
+            public query(): { promise: Promise<{ [key: string]: string }[]> } {
+                return { promise: Promise.reject("MockDatabaseService:query") };
             }
         }
         const state = mergeState(initialState, {
@@ -843,7 +845,7 @@ describe("Selection logics", () => {
 
             // Act
             // addQuery will fail since addDataSource is set to reject in MockDatabaseService
-            store.dispatch(addQuery(mockQuery(dataSourceName, new File([], "Mock Data Source"))));
+            store.dispatch(addQuery(mockQuery(dataSourceName, new File([], dataSourceName))));
             await logicMiddleware.whenComplete();
 
             // Assert
@@ -853,6 +855,114 @@ describe("Selection logics", () => {
                     payload: {
                         dataSourceName,
                         error: "Unknown error while adding query",
+                    },
+                })
+            ).to.be.true;
+        });
+
+        it("adds count to new query name if name already exists", async () => {
+            const dataSourceName = "Mock Data Source";
+            const matchingQuery: Query = mockQuery(dataSourceName, "fake-uri.test");
+
+            const state = mergeState(initialState, {
+                interaction: {
+                    platformDependentServices: {
+                        databaseService: new MockDatabaseService(),
+                    },
+                },
+                selection: {
+                    queries: [matchingQuery],
+                },
+            });
+            const { store, logicMiddleware, actions } = configureMockStore({
+                state,
+                logics: selectionLogics,
+            });
+
+            // Act
+            store.dispatch(addQuery(matchingQuery));
+            await logicMiddleware.whenComplete();
+
+            // Assert
+            expect(
+                actions.includesMatch({
+                    type: ADD_QUERY,
+                    payload: {
+                        name: `${dataSourceName} (1)`, // Renamed with count
+                        parts: matchingQuery.parts,
+                    },
+                })
+            ).to.be.true;
+        });
+
+        it("increments count in new query name if any existing queries match", async () => {
+            const dataSourceName = "Mock Data Source";
+            const matchingQuery = mockQuery(dataSourceName, "fake-uri.test");
+            const matchingQuery1 = mockQuery(`${dataSourceName} (1)`, "fake-uri-1.test");
+            const matchingQuery2 = mockQuery(`${dataSourceName} (2)`, "fake-uri-2.test");
+
+            const state = mergeState(initialState, {
+                interaction: {
+                    platformDependentServices: {
+                        databaseService: new MockDatabaseService(),
+                    },
+                },
+                selection: {
+                    queries: [matchingQuery, matchingQuery1, matchingQuery2],
+                },
+            });
+            const { store, logicMiddleware, actions } = configureMockStore({
+                state,
+                logics: selectionLogics,
+            });
+
+            // Act
+            store.dispatch(addQuery(matchingQuery1)); // attempting to duplicate "Mock Data Source (1)"
+            await logicMiddleware.whenComplete();
+
+            // Assert
+            expect(
+                actions.includesMatch({
+                    type: ADD_QUERY,
+                    payload: {
+                        name: `${dataSourceName} (3)`, // renamed to "Mock Data Source (3)" instead
+                        parts: matchingQuery1.parts,
+                    },
+                })
+            ).to.be.true;
+        });
+
+        it("makes new query name unique by finding the first possible unused number", async () => {
+            const dataSourceName = "Mock Data Source";
+            const matchingQuery = mockQuery(dataSourceName, "fake-uri.test");
+            const matchingQuery2 = mockQuery(`${dataSourceName} (2)`, "fake-uri-2.test");
+
+            const state = mergeState(initialState, {
+                interaction: {
+                    platformDependentServices: {
+                        databaseService: new MockDatabaseService(),
+                    },
+                },
+                selection: {
+                    queries: [matchingQuery, matchingQuery2],
+                },
+            });
+            const { store, logicMiddleware, actions } = configureMockStore({
+                state,
+                logics: selectionLogics,
+            });
+
+            // Act
+            store.dispatch(addQuery(matchingQuery2)); // attempting to duplicate "Mock Data Source (2)"
+            await logicMiddleware.whenComplete();
+
+            // Assert
+            expect(
+                actions.includesMatch({
+                    type: ADD_QUERY,
+                    payload: {
+                        name: `${dataSourceName} (1)`, // renamed to "Mock Data Source (1)" instead
+                        parts: matchingQuery2.parts,
                     },
                 })
             ).to.be.true;
@@ -1234,6 +1344,9 @@ describe("Selection logics", () => {
                 public deleteSourceMetadata(): Promise<void> {
                     return Promise.resolve();
                 }
+                public deleteSourceProvenance(): Promise<void> {
+                    return Promise.resolve();
+                }
             }
             const state = mergeState(initialState, {
                 interaction: {
@@ -1292,6 +1405,7 @@ describe("Selection logics", () => {
                 })
             ).to.be.true;
             expect(actions.includesMatch(changeSourceMetadata())).to.be.true;
+            expect(actions.includesMatch(changeProvenanceSource())).to.be.true;
             expect(actions.includesMatch(changeDataSources(mockDataSources))).to.be.true;
         });
     });

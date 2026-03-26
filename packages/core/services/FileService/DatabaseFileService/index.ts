@@ -8,7 +8,7 @@ import FileService, {
 } from "..";
 import DatabaseService from "../../DatabaseService";
 import DatabaseServiceNoop from "../../DatabaseService/DatabaseServiceNoop";
-import FileDownloadService, { DownloadResolution, DownloadResult } from "../../FileDownloadService";
+import FileDownloadService, { DownloadResult } from "../../FileDownloadService";
 import FileDownloadServiceNoop from "../../FileDownloadService/FileDownloadServiceNoop";
 import IncludeFilter from "../../../entity/FileFilter/IncludeFilter";
 import ExcludeFilter from "../../../entity/FileFilter/ExcludeFilter";
@@ -16,7 +16,7 @@ import FileSelection from "../../../entity/FileSelection";
 import FileSet from "../../../entity/FileSet";
 import FileDetail from "../../../entity/FileDetail";
 import SQLBuilder from "../../../entity/SQLBuilder";
-import { Environment } from "../../../constants";
+import { Environment, HIDDEN_UID_ANNOTATION } from "../../../constants";
 
 interface Config {
     databaseService: DatabaseService;
@@ -36,7 +36,7 @@ export default class DatabaseFileService implements FileService {
         row: { [key: string]: string },
         env: Environment
     ): FileDetail {
-        const uniqueId: string | undefined = row[DatabaseService.HIDDEN_UID_ANNOTATION];
+        const uniqueId: string | undefined = row[HIDDEN_UID_ANNOTATION];
         if (!uniqueId) {
             throw new Error("Missing auto-generated unique ID");
         }
@@ -48,7 +48,7 @@ export default class DatabaseFileService implements FileService {
                         ([name, values]) =>
                             !isNil(values) &&
                             // Omit hidden UID annotation
-                            name !== DatabaseService.HIDDEN_UID_ANNOTATION
+                            name !== HIDDEN_UID_ANNOTATION
                     )
                     .map(([name, values]) => ({
                         name,
@@ -75,7 +75,11 @@ export default class DatabaseFileService implements FileService {
     }
 
     public async getCountOfMatchingFiles(fileSet: FileSet): Promise<number> {
-        if (!this.dataSourceNames.length) {
+        // Async DB means source may exist in query params but not in database
+        const dataSourcesExistInDatabase = this.dataSourceNames.every((name) =>
+            this.databaseService.hasDataSource(name)
+        );
+        if (!this.dataSourceNames.length || !dataSourcesExistInDatabase) {
             throw new Error("Data source is not prepared");
         }
 
@@ -85,10 +89,10 @@ export default class DatabaseFileService implements FileService {
             .select(`COUNT(*) AS ${select_key}`)
             .from(this.dataSourceNames)
             // Remove sort if present
-            .orderBy()
+            .removeOrderBy()
             .toSQL();
 
-        const rows = await this.databaseService.query(sql);
+        const rows = await this.databaseService.query(sql).promise;
         return parseInt(rows[0][select_key], 10);
     }
 
@@ -112,7 +116,6 @@ export default class DatabaseFileService implements FileService {
         if (!this.dataSourceNames.length) {
             return [];
         }
-
         const sql = request.fileSet
             .toQuerySQLBuilder()
             .from(this.dataSourceNames)
@@ -120,7 +123,7 @@ export default class DatabaseFileService implements FileService {
             .limit(request.limit)
             .toSQL();
 
-        const rows = await this.databaseService.query(sql);
+        const rows = await this.databaseService.query(sql).promise;
         const env = this.downloadService.getEnvironmentFromUrl();
         return rows.map((row) => DatabaseFileService.convertDatabaseRowToFileDetail(row, env));
     }
@@ -175,15 +178,13 @@ export default class DatabaseFileService implements FileService {
         selections.forEach((selection) => {
             selection.indexRanges.forEach((indexRange) => {
                 const subQuery = new SQLBuilder()
-                    .select(`${DatabaseService.HIDDEN_UID_ANNOTATION}`)
+                    .select(HIDDEN_UID_ANNOTATION)
                     .from(dataSourceNames)
                     .offset(indexRange.start)
                     .limit(indexRange.end - indexRange.start + 1);
 
                 DatabaseFileService.applyFiltersAndSorting(subQuery, selection);
-                subQueries.push(
-                    `${DatabaseService.HIDDEN_UID_ANNOTATION} IN (${subQuery.toSQL()})`
-                );
+                subQueries.push(`${HIDDEN_UID_ANNOTATION} IN (${subQuery.toSQL()})`);
             });
         });
         // sqlBuilder whereOr isnt implemented, so we add our own "OR"
@@ -229,24 +230,18 @@ export default class DatabaseFileService implements FileService {
         sql: string,
         format: "csv" | "json" | "parquet"
     ): Promise<DownloadResult> {
-        // If the file system is accessible we can just have DuckDB write the
-        // output query directly to the system rather than to a buffer then the file
+        let buffer;
+        const name = `file-selection-${new Date()}.${format}`;
+        // If the file system is accessible, find the default download location
         if (this.downloadService.isFileSystemAccessible) {
             const downloadDir = await this.downloadService.getDefaultDownloadDirectory();
             const separator = navigator.userAgent.toLowerCase().includes("windows") ? "\\" : "/";
-            const destination = `${downloadDir}${separator}file-selection-${Date.now().toLocaleString(
-                "en-us"
-            )}`;
-            await this.databaseService.saveQuery(destination, sql, format);
-            return {
-                downloadRequestId: uniqueId(),
-                msg: `File downloaded to ${destination}.${format}`,
-                resolution: DownloadResolution.SUCCESS,
-            };
+            const destination = `${downloadDir}${separator}${name}`;
+            buffer = await this.databaseService.saveQuery(destination, sql, format);
+        } else {
+            buffer = await this.databaseService.saveQuery(uniqueId(), sql, format);
         }
 
-        const buffer = await this.databaseService.saveQuery(uniqueId(), sql, format);
-        const name = `file-selection-${new Date()}.${format}`;
         return this.downloadService.download(
             {
                 id: name,
@@ -268,7 +263,7 @@ export default class DatabaseFileService implements FileService {
         const sql = `\
             UPDATE '${tableName}' \
             SET ${columnAssignments.join(", ")} \
-            WHERE ${DatabaseService.HIDDEN_UID_ANNOTATION} = '${fileId}'; \
+            WHERE ${HIDDEN_UID_ANNOTATION} = '${fileId}'; \
         `;
         return this.databaseService.execute(sql);
     }

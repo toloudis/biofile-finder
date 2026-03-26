@@ -1,9 +1,11 @@
+import * as duckdb from "@duckdb/duckdb-wasm";
 import axios from "axios";
-import { isEmpty } from "lodash";
+import { isEmpty, mapKeys } from "lodash";
 
-import { AICS_FMS_DATA_SOURCE_NAME } from "../../constants";
+import { AICS_FMS_DATA_SOURCE_NAME, HIDDEN_UID_ANNOTATION } from "../../constants";
 import Annotation from "../../entity/Annotation";
 import { AnnotationType } from "../../entity/AnnotationFormatter";
+import { EdgeDefinition } from "../../entity/Graph";
 import { Source } from "../../entity/SearchParams";
 import SQLBuilder from "../../entity/SQLBuilder";
 import DataSourcePreparationError from "../../errors/DataSourcePreparationError";
@@ -18,45 +20,196 @@ enum PreDefinedColumn {
 }
 const PRE_DEFINED_COLUMNS = Object.values(PreDefinedColumn);
 
+// Map each actual column name to the predefined column name when they fuzzy-match.
+function getActualToPreDefinedColumnMap(columns: string[]): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const preDefinedColumn of PRE_DEFINED_COLUMNS) {
+        const preDefinedColumnSimplified = preDefinedColumn.toLowerCase().replace(" ", "");
+        // Grab near matches to the pre-defined columns like "file_name" for "File Name"
+        const matches = [...columns].filter(
+            (column) =>
+                preDefinedColumnSimplified ===
+                // Matches regardless of caps, whitespace, hyphens, or underscores
+                column.toLowerCase().replaceAll(/\s|-|_/g, "")
+        );
+
+        // Doesn't seem like we should guess at a pre-defined column match in this case
+        // so just toss up a user-actionable error to try to get them to retry
+        if (matches.length > 1) {
+            throw new Error(
+                `Too many columns similar to pre-defined column: "${preDefinedColumn}", narrow
+                these down to just one column exactly equal or similar to "${preDefinedColumn}".
+                Found: ${matches}.`
+            );
+        }
+        if (matches.length === 1) {
+            map.set(matches[0], preDefinedColumn);
+        }
+    }
+    return map;
+}
+
+/**
+ * Derive a "File Name" from a path-like column (local path or URL).
+ */
+function getFileNameFromPathExpression(quotedPathColumn: string): string {
+    const cleaned = `REGEXP_REPLACE(
+        REGEXP_REPLACE(${quotedPathColumn}, '[?#].*$', ''),
+        '/+$',
+        ''
+    )`;
+    const basename = `REGEXP_EXTRACT(${cleaned}, '([^/]+)$', 1)`;
+    const stripOme = `REGEXP_REPLACE(${basename}, '(?i)\\\\.ome$', '')`;
+
+    return `COALESCE(NULLIF(${stripOme}, ''), ${quotedPathColumn})`;
+}
+
+/**
+ * For parquets: add a computed "File Name" when we have "File Path" but not "File Name".
+ */
+export function getParquetFileNameSelectPart(
+    actualToPreDefined: Map<string, string>
+): string | null {
+    const hasFileName = [...actualToPreDefined.values()].includes(PreDefinedColumn.FILE_NAME);
+    if (hasFileName) return null;
+
+    const pathColumn = [...actualToPreDefined.entries()].find(
+        ([, predefined]) => predefined === PreDefinedColumn.FILE_PATH
+    )?.[0];
+    if (!pathColumn) return null;
+
+    return `${getFileNameFromPathExpression(`"${pathColumn}"`)} AS "${PreDefinedColumn.FILE_NAME}"`;
+}
+
 /**
  * Service reponsible for querying against a database
  */
 export default abstract class DatabaseService {
     public static readonly LIST_DELIMITER = ",";
-    // Name of the hidden column BFF uses to uniquely identify rows
-    public static readonly HIDDEN_UID_ANNOTATION = "hidden_bff_uid";
     protected readonly SOURCE_METADATA_TABLE = "source_metadata";
-    // "Open file link" as a datatype must be hardcoded, and CAN NOT change
-    // without BREAKING visibility in the dataset released in 2024 as part
-    // of the EMT Data Release paper
-    private static readonly OPEN_FILE_LINK_TYPE = "Open file link";
-    private static readonly ANNOTATION_TYPE_SET = new Set([
-        ...Object.values(AnnotationType),
-        DatabaseService.OPEN_FILE_LINK_TYPE,
-    ]);
+    protected readonly SOURCE_PROVENANCE_TABLE = "source_provenance";
+    private static readonly ANNOTATION_TYPE_SET = new Set(Object.values(AnnotationType));
     private sourceMetadataName?: string;
+    public sourceProvenanceName?: string;
     private currentAggregateSource?: string;
     // Initialize with AICS FMS data source name to pretend it always exists
     protected readonly existingDataSources = new Set([AICS_FMS_DATA_SOURCE_NAME]);
-    private readonly dataSourceToAnnotationsMap: Map<string, Annotation[]> = new Map();
+    protected readonly dataSourceToAnnotationsMap: Map<string, Annotation[]> = new Map();
+    private readonly dataSourceToProvenanceMap: Map<string, EdgeDefinition[]> = new Map();
+    // Data source names that are views (parquet), so we DROP VIEW on delete
+    private readonly parquetDirectViewNames = new Set<string>();
 
-    public abstract saveQuery(
-        _destination: string,
-        _sql: string,
-        _format: "csv" | "parquet" | "json"
-    ): Promise<Uint8Array>;
+    protected database: duckdb.AsyncDuckDB | undefined;
 
-    public abstract query(_sql: string): Promise<{ [key: string]: any }[]>;
+    constructor() {
+        this.addDataSource = this.addDataSource.bind(this);
+        this.execute = this.execute.bind(this);
+        this.query = this.query.bind(this);
+    }
 
-    protected abstract addDataSource(
-        _name: string,
-        _type: "csv" | "json" | "parquet",
-        _uri: string | File
-    ): Promise<void>;
+    public async saveQuery(
+        destination: string,
+        sql: string,
+        format: "parquet" | "csv" | "json"
+    ): Promise<Uint8Array> {
+        if (!this.database) {
+            throw new Error("Database failed to initialize");
+        }
 
-    public abstract execute(_sql: string): Promise<void>;
+        const resultName = `${destination}.${format}`;
+        const formatOptions = format === "json" ? ", ARRAY true" : "";
+        const finalSQL = `COPY (${sql}) TO '${resultName}' (FORMAT '${format}'${formatOptions});`;
+        const connection = await this.database.connect();
+        try {
+            await connection.send(finalSQL);
+            return await this.database.copyFileToBuffer(resultName);
+        } finally {
+            await connection.close();
+        }
+    }
 
-    private static columnTypeToAnnotationType(columnType: string): AnnotationType {
+    public query(
+        sql: string
+    ): { promise: Promise<{ [key: string]: any }[]>; cancel?: (reason?: string) => void } {
+        return { promise: this.runQuery(sql) };
+    }
+
+    private async runQuery(sql: string): Promise<{ [key: string]: any }[]> {
+        if (!this.database) {
+            throw new Error("Database failed to initialize");
+        }
+        const connection = await this.database?.connect();
+        try {
+            const result = await connection.query(sql);
+            const resultAsArray = result.toArray();
+            const resultAsJSONString = JSON.stringify(
+                resultAsArray,
+                (_, value) => (typeof value === "bigint" ? value.toString() : value) // return everything else unchanged
+            );
+            return JSON.parse(resultAsJSONString);
+        } catch (err) {
+            throw new Error(
+                `${(err as Error).message}. \nThe above error occured while executing query: ${sql}`
+            );
+        } finally {
+            await connection.close();
+        }
+    }
+
+    public close(): void {
+        this.database?.detach();
+    }
+
+    protected async addDataSource(
+        name: string,
+        type: "csv" | "json" | "parquet",
+        uri: string | File
+    ): Promise<void> {
+        if (!this.database) {
+            throw new Error("Database failed to initialize");
+        }
+
+        if (uri instanceof File) {
+            await this.database.registerFileHandle(
+                name,
+                uri,
+                duckdb.DuckDBDataProtocol.BROWSER_FILEREADER,
+                true
+            );
+        } else {
+            const protocol = uri.startsWith("s3")
+                ? duckdb.DuckDBDataProtocol.S3
+                : duckdb.DuckDBDataProtocol.HTTP;
+
+            await this.database.registerFileURL(name, uri, protocol, false);
+        }
+
+        if (type === "parquet") {
+            await this.createParquetDirectView(name);
+        } else if (type === "json") {
+            await this.execute(`CREATE TABLE "${name}" AS FROM read_json_auto('${name}');`);
+        } else {
+            // Default to CSV
+            await this.execute(
+                `CREATE TABLE "${name}" AS FROM read_csv_auto('${name}', header=true, all_varchar=true);`
+            );
+        }
+    }
+
+    public async execute(sql: string): Promise<void> {
+        if (!this.database) {
+            throw new Error("Database failed to initialize");
+        }
+
+        const connection = await this.database.connect();
+        try {
+            await connection.query(sql);
+        } finally {
+            await connection.close();
+        }
+    }
+
+    protected static columnTypeToAnnotationType(columnType: string): AnnotationType {
         switch (columnType) {
             case "INTEGER":
             case "BIGINT":
@@ -76,12 +229,8 @@ export default abstract class DatabaseService {
             : str;
     }
 
-    constructor() {
-        // 'this' scope gets lost when a higher order class (ex. DatabaseService)
-        // calls a lower level class (ex. DatabaseServiceWeb)
-        this.addDataSource = this.addDataSource.bind(this);
-        this.execute = this.execute.bind(this);
-        this.query = this.query.bind(this);
+    public hasDataSource(dataSourceName: string): boolean {
+        return this.existingDataSources.has(dataSourceName);
     }
 
     public async prepareDataSources(
@@ -90,8 +239,8 @@ export default abstract class DatabaseService {
     ): Promise<void> {
         await Promise.all(
             dataSources
-                .filter((dataSource) => !this.existingDataSources.has(dataSource.name))
-                .map((dataSource) => this.prepareDataSource(dataSource, skipNormalization))
+                .filter((dataSource) => !this.hasDataSource(dataSource.name))
+                .map((dataSource) => this.prepareDataSourceWrapper(dataSource, skipNormalization))
         );
 
         // Because when querying multiple data sources column differences can complicate the queries
@@ -102,7 +251,10 @@ export default abstract class DatabaseService {
         }
     }
 
-    private async prepareDataSource(dataSource: Source, skipNormalization: boolean): Promise<void> {
+    private async prepareDataSourceWrapper(
+        dataSource: Source,
+        skipNormalization: boolean
+    ): Promise<void> {
         const { name, type, uri } = dataSource;
 
         if (!type || !uri) {
@@ -119,25 +271,7 @@ export default abstract class DatabaseService {
         }
 
         try {
-            // Add the data source as a table on the database
-            await this.addDataSource(name, type, uri);
-
-            // Add data source name to in-memory set
-            // for quick data source checks
-            this.existingDataSources.add(name);
-
-            // Unless skipped, this will ensure the table is prepared
-            // for querying with the expected columns & uniqueness constraints
-            if (!skipNormalization) {
-                await this.normalizeDataSourceColumnNames(name);
-
-                const errors = await this.checkDataSourceForErrors(name);
-                if (errors.length) {
-                    throw new Error(errors.join("</br></br>"));
-                }
-
-                await this.addRequiredColumns(dataSource.name);
-            }
+            await this.prepareDataSource(dataSource, skipNormalization);
         } catch (err) {
             let formattedError = (err as Error).message;
             // DuckDB does not provide informative server errors, so send a
@@ -163,6 +297,49 @@ export default abstract class DatabaseService {
         }
     }
 
+    protected async prepareDataSource(
+        dataSource: Source,
+        skipNormalization: boolean
+    ): Promise<void> {
+        const { name, type, uri } = dataSource;
+
+        if (!type || !uri) {
+            throw new DataSourcePreparationError(
+                `Lost access to the data source.\
+                </br> \
+                Local data sources must be re-uploaded with each \
+                page refresh to gain access to the data source file \
+                on your computer. \
+                To avoid this, consider using cloud storage for the \
+                file and sharing the URL.`,
+                name
+            );
+        }
+        // Add the data source as a table on the database
+        await this.addDataSource(name, type, uri);
+
+        // Add data source name to in-memory set
+        // for quick data source checks
+        this.existingDataSources.add(name);
+
+        // Unless skipped, this will ensure the table is prepared
+        // for querying with the expected columns & uniqueness constraints
+        if (!skipNormalization) {
+            if (type !== "parquet") {
+                await this.normalizeDataSourceColumnNames(name);
+            }
+
+            const errors = await this.checkDataSourceForErrors(name);
+            if (errors.length) {
+                throw new DataSourcePreparationError(errors.join("</br></br>"), name);
+            }
+
+            if (type !== "parquet") {
+                await this.addRequiredColumns(name);
+            }
+        }
+    }
+
     public async prepareSourceMetadata(sourceMetadata: Source): Promise<void> {
         const isPreviousSource = sourceMetadata.name === this.sourceMetadataName;
         if (isPreviousSource) {
@@ -170,7 +347,7 @@ export default abstract class DatabaseService {
         }
 
         await this.deleteSourceMetadata();
-        await this.prepareDataSource(
+        await this.prepareDataSourceWrapper(
             {
                 ...sourceMetadata,
                 name: this.SOURCE_METADATA_TABLE,
@@ -180,15 +357,44 @@ export default abstract class DatabaseService {
         this.sourceMetadataName = sourceMetadata.name;
     }
 
+    private async prepareSourceProvenance(sourceProvenance: Source): Promise<void> {
+        const isPreviousSource = sourceProvenance.name === this.sourceProvenanceName;
+        if (isPreviousSource) {
+            return;
+        }
+        await this.deleteSourceProvenance();
+        await this.prepareDataSourceWrapper(
+            {
+                ...sourceProvenance,
+                name: this.SOURCE_PROVENANCE_TABLE,
+            },
+            true
+        );
+        this.sourceProvenanceName = sourceProvenance.name;
+    }
+
+    public async deleteSourceProvenance(): Promise<void> {
+        if (this.sourceProvenanceName) {
+            await this.deleteDataSource(this.SOURCE_PROVENANCE_TABLE);
+            this.dataSourceToProvenanceMap.clear();
+            this.sourceProvenanceName = undefined;
+        }
+    }
+
     public async deleteSourceMetadata(): Promise<void> {
         await this.deleteDataSource(this.SOURCE_METADATA_TABLE);
         this.dataSourceToAnnotationsMap.clear();
     }
 
-    private async deleteDataSource(dataSource: string): Promise<void> {
+    protected async deleteDataSource(dataSource: string): Promise<void> {
         this.existingDataSources.delete(dataSource);
         this.dataSourceToAnnotationsMap.delete(dataSource);
-        await this.execute(`DROP TABLE IF EXISTS "${dataSource}"`);
+        if (this.parquetDirectViewNames.has(dataSource)) {
+            this.parquetDirectViewNames.delete(dataSource);
+            await this.execute(`DROP VIEW IF EXISTS "${dataSource}"`);
+        } else {
+            await this.execute(`DROP TABLE IF EXISTS "${dataSource}"`);
+        }
     }
 
     /*
@@ -201,7 +407,7 @@ export default abstract class DatabaseService {
             // Add hidden UID column to uniquely identify rows
             `
                 ALTER TABLE "${name}"
-                ADD COLUMN ${DatabaseService.HIDDEN_UID_ANNOTATION} INT
+                ADD COLUMN ${HIDDEN_UID_ANNOTATION} INT
             `,
             this.getUpdateHiddenUIDSQL(name),
         ];
@@ -212,34 +418,12 @@ export default abstract class DatabaseService {
          * First checks if a "File Name" already exists,
          * then makes best shot attempt at auto-generating a "File Name"
          * from the "File Path", then defaults to full path if this fails.
-         *
-         * Description of SQL:
-         * - COALESCE - returns the first non-null value in the list
-         * - NULLIF - returns null if the two arguments are equal
-         * - REGEXP_REPLACE - replaces a substring with another substring
-         * First creates a "trimmed path" by replacing the last file extension and
-         * any directories in the "File Path" with empty strings.
-         * Then checks for and removes .ome at the end of the "trimmed path".
-         * If the "trimmed path" is an empty string, sets the generated file name to NULL.
-         * Then uses COALESCE to default to the full path if generated file name is NULL.
          */
         const fileNameGenerationSQL = `
                 UPDATE "${name}"
                 SET "${PreDefinedColumn.FILE_NAME}" = COALESCE(
                     "${PreDefinedColumn.FILE_NAME}",
-                    NULLIF(
-                        REGEXP_REPLACE(
-                            REGEXP_REPLACE(
-                                "${PreDefinedColumn.FILE_PATH}",
-                                '^.*/([^/]*?)(\\.[^/.]+)?$',
-                                '\\1',
-                                ''
-                            ),
-                            '\\.ome$',
-                            ''
-                        ),
-                    ''),
-                    "${PreDefinedColumn.FILE_PATH}"
+                    ${getFileNameFromPathExpression(`"${PreDefinedColumn.FILE_PATH}"`)}
                 );`;
         if (!dataSourceColumns.has(PreDefinedColumn.FILE_NAME)) {
             commandsToExecute.push(`
@@ -271,7 +455,7 @@ export default abstract class DatabaseService {
         // column addition manually
         return `
             UPDATE "${tableName}"
-            SET "${DatabaseService.HIDDEN_UID_ANNOTATION}" = SQ.row
+            SET "${HIDDEN_UID_ANNOTATION}" = SQ.row
             FROM (
                 SELECT "${PreDefinedColumn.FILE_PATH}", ROW_NUMBER() OVER (ORDER BY "${PreDefinedColumn.FILE_PATH}") AS row
                 FROM "${tableName}"
@@ -334,45 +518,13 @@ export default abstract class DatabaseService {
     */
     private async normalizeDataSourceColumnNames(dataSourceName: string): Promise<void> {
         const columnsOnDataSource = await this.getColumnsOnDataSource(dataSourceName);
+        const actualToPreDefined = getActualToPreDefinedColumnMap([...columnsOnDataSource]);
 
-        const combinedAlterCommands = PRE_DEFINED_COLUMNS
-            // Filter out any pre-defined columns that are exact matches to columns on the data source
-            // since those are already perfect
-            .filter((preDefinedColumn) => !columnsOnDataSource.has(preDefinedColumn))
-            // Map the rest to SQL alter table commands to rename the columns
-            .flatMap((preDefinedColumn) => {
-                const preDefinedColumnSimplified = preDefinedColumn.toLowerCase().replace(" ", "");
-
-                // Grab near matches to the pre-defined columns like "file_name" for "File Name"
-                const matches = [...columnsOnDataSource].filter(
-                    (column) =>
-                        preDefinedColumnSimplified ===
-                        // Matches regardless of caps, whitespace, hyphens, or underscores
-                        column.toLowerCase().replaceAll(/\s|-|_/g, "")
-                );
-
-                // Doesn't seem like we should guess at a pre-defined column match in this case
-                // so just toss up a user-actionable error to try to get them to retry
-                if (matches.length > 1) {
-                    throw new Error(
-                        `Too many columns similar to pre-defined column: "${preDefinedColumn}", narrow
-                        these down to just one column exactly equal or similar to "${preDefinedColumn}".
-                        Found: ${matches}.`
-                    );
-                }
-
-                if (matches.length < 1) {
-                    return []; // No-op essentially if no matches
-                }
-
-                // Rename matching column name to new pre-defined column
-                return [
-                    `
-                    ALTER TABLE "${dataSourceName}"
-                    RENAME COLUMN "${matches[0]}" TO '${preDefinedColumn}'
-                `,
-                ];
-            })
+        const combinedAlterCommands = [...actualToPreDefined.entries()]
+            .map(
+                ([actualColumn, preDefinedColumn]) =>
+                    `ALTER TABLE "${dataSourceName}" RENAME COLUMN "${actualColumn}" TO '${preDefinedColumn}'`
+            )
             .join("; ");
 
         if (combinedAlterCommands) {
@@ -383,6 +535,39 @@ export default abstract class DatabaseService {
         this.dataSourceToAnnotationsMap.delete(dataSourceName);
     }
 
+    // Create a view over the parquet file that exposes columns under predefined names (e.g. "File Path")
+    // and adds hidden_bff_uid.
+    private async createParquetDirectView(name: string): Promise<void> {
+        // 1. Get original column names from the user's table.
+        // Note: we don't use this.getColumnsOnDataSource, since that expects a
+        // fully built data source, and this function is used for creating a
+        // data source.
+        const sql = `DESCRIBE SELECT * FROM parquet_scan("${name}")`;
+        const rows = await this.query(sql).promise;
+        const rawColumns = rows.map((row) => row["column_name"] as string);
+        // 2. Determine which columns need to be renamed, if any
+        const actualToPreDefined = getActualToPreDefinedColumnMap(rawColumns);
+        // 3. Prepare the SQL for renaming columns in the CREATE VIEW
+        const selectParts = rawColumns.map((col) => {
+            const preDefined = actualToPreDefined.get(col);
+            if (preDefined !== undefined) {
+                return `"${col}" AS "${preDefined}"`;
+            }
+            return `"${col}"`;
+        });
+        const fileNameSelectPart = getParquetFileNameSelectPart(actualToPreDefined);
+        if (fileNameSelectPart !== null) {
+            selectParts.push(fileNameSelectPart);
+        }
+        selectParts.push(`"file_row_number" AS "${HIDDEN_UID_ANNOTATION}"`);
+        // 4. Create the view for this data source
+        const createViewSql = `CREATE VIEW "${name}"
+            AS SELECT ${selectParts.join(", ")}
+            FROM parquet_scan('${name}');`;
+        await this.execute(createViewSql);
+        this.parquetDirectViewNames.add(name);
+    }
+
     private async getRowsWhereColumnIsBlank(dataSource: string, column: string): Promise<number[]> {
         const blankColumnQueryResult = await this.query(`
             SELECT A.row
@@ -391,11 +576,14 @@ export default abstract class DatabaseService {
                 FROM "${dataSource}"
             ) AS A
             WHERE TRIM(A."${column}") IS NULL
-        `);
+        `).promise;
         return blankColumnQueryResult.map((row) => row.row);
     }
 
     private async aggregateDataSources(dataSources: Source[]): Promise<void> {
+        if (dataSources.some((source) => source.type === "parquet")) {
+            throw new Error("Parquet tables cannot be combined to query multiple data sources.");
+        }
         const viewName = dataSources
             .map((source) => source.name)
             .sort()
@@ -461,6 +649,72 @@ export default abstract class DatabaseService {
         await this.execute(this.getUpdateHiddenUIDSQL(viewName));
     }
 
+    public async processProvenance(provenanceSource: Source): Promise<EdgeDefinition[]> {
+        await this.prepareSourceProvenance(provenanceSource);
+
+        const sql = new SQLBuilder().select("*").from(`${this.SOURCE_PROVENANCE_TABLE}`).toSQL();
+        try {
+            const rows = await this.query(sql).promise;
+            const parentsAndChildren = new Set<string>();
+            return rows
+                .map((row) =>
+                    Object.keys(row).reduce(
+                        (mapSoFar, key) => ({
+                            ...mapSoFar,
+                            [key.toLowerCase().trim()]:
+                                typeof row[key] !== "object"
+                                    ? row[key]
+                                    : mapKeys(row[key], (_value, innerKey) =>
+                                          innerKey.toLowerCase().trim()
+                                      ),
+                        }),
+                        {} as Record<string, any>
+                    )
+                )
+                .map((row) => {
+                    try {
+                        const parentAndChildKey = `${row["parent"]}-${row["child"]}`;
+                        if (parentsAndChildren.has(parentAndChildKey)) {
+                            throw new Error(
+                                `Parent (${row["parent"]}) and Child (${row["child"]}) combination found multiple times`
+                            );
+                        }
+
+                        parentsAndChildren.add(parentAndChildKey);
+                        return {
+                            relationship: row["relationship"],
+                            relationshipType: row["relationship type"],
+                            parent: {
+                                name: row["parent"],
+                                type: row["parent type"],
+                            },
+                            child: {
+                                name: row["child"],
+                                type: row["child type"],
+                            },
+                        };
+                    } catch (err) {
+                        if ((err as Error).message.includes("key")) {
+                            throw new Error(
+                                `Unexpected format for provenance data. Check the documentation
+                                for what BFF expects provenance data to look like.
+                                Error: ${(err as Error).message}`
+                            );
+                        }
+                        throw err;
+                    }
+                });
+        } catch (err) {
+            // Source provenance file may not have been supplied
+            // and/or the columns may not exist
+            const errMsg = typeof err === "string" ? err : err instanceof Error ? err.message : "";
+            if (errMsg.includes("does not exist") || errMsg.includes("not found in FROM clause")) {
+                return [];
+            }
+            throw err;
+        }
+    }
+
     public async fetchAnnotations(dataSourceNames: string[]): Promise<Annotation[]> {
         const aggregateDataSourceName = dataSourceNames.sort().join(", ");
         const hasAnnotations = this.dataSourceToAnnotationsMap.has(aggregateDataSourceName);
@@ -473,9 +727,9 @@ export default abstract class DatabaseService {
                 .select("column_name, data_type")
                 .from('information_schema"."columns')
                 .where(`table_name = '${aggregateDataSourceName}'`)
-                .where(`column_name != '${DatabaseService.HIDDEN_UID_ANNOTATION}'`)
+                .where(`column_name != '${HIDDEN_UID_ANNOTATION}'`)
                 .toSQL();
-            const rows = await this.query(sql);
+            const rows = await this.query(sql).promise;
             if (isEmpty(rows)) {
                 throw new Error(`Unable to fetch annotations for ${aggregateDataSourceName}`);
             }
@@ -483,21 +737,16 @@ export default abstract class DatabaseService {
                 this.fetchAnnotationDescriptions(),
                 this.fetchAnnotationTypes(),
             ]);
+
             const annotations = rows.map(
                 (row) =>
                     new Annotation({
                         annotationName: row["column_name"],
                         annotationDisplayName: row["column_name"],
                         description: annotationNameToDescriptionMap[row["column_name"]] || "",
-                        isOpenFileLink:
-                            annotationNameToTypeMap[row["column_name"]] ===
-                            DatabaseService.OPEN_FILE_LINK_TYPE,
                         type:
-                            annotationNameToTypeMap[row["column_name"]] ===
-                            DatabaseService.OPEN_FILE_LINK_TYPE
-                                ? AnnotationType.STRING
-                                : (annotationNameToTypeMap[row["column_name"]] as AnnotationType) ||
-                                  DatabaseService.columnTypeToAnnotationType(row["data_type"]),
+                            (annotationNameToTypeMap[row["column_name"]] as AnnotationType) ||
+                            DatabaseService.columnTypeToAnnotationType(row["data_type"]),
                     })
             );
             this.dataSourceToAnnotationsMap.set(aggregateDataSourceName, annotations);
@@ -506,12 +755,12 @@ export default abstract class DatabaseService {
         return this.dataSourceToAnnotationsMap.get(aggregateDataSourceName) || [];
     }
 
-    private async getColumnsOnDataSource(name: string): Promise<Set<string>> {
+    protected async getColumnsOnDataSource(name: string): Promise<Set<string>> {
         const annotations = await this.fetchAnnotations([name]);
         return new Set(annotations.map((annotation) => annotation.name));
     }
 
-    private async fetchAnnotationDescriptions(): Promise<Record<string, string>> {
+    protected async fetchAnnotationDescriptions(): Promise<Record<string, string>> {
         // Unless we have actually added the source metadata table we can't fetch the descriptions
         if (!this.existingDataSources.has(this.SOURCE_METADATA_TABLE)) {
             return {};
@@ -522,7 +771,7 @@ export default abstract class DatabaseService {
             .from(this.SOURCE_METADATA_TABLE)
             .toSQL();
         try {
-            const rows = await this.query(sql);
+            const rows = await this.query(sql).promise;
             return rows.reduce(
                 (map, row) => ({ ...map, [row["Column Name"]]: row["Description"] }),
                 {}
@@ -550,7 +799,7 @@ export default abstract class DatabaseService {
             .toSQL();
 
         try {
-            const rows = await this.query(sql);
+            const rows = await this.query(sql).promise;
             return rows.reduce(
                 (map, row) =>
                     DatabaseService.ANNOTATION_TYPE_SET.has(row["Type"])
@@ -570,6 +819,7 @@ export default abstract class DatabaseService {
         }
     }
 
+    // To do: unclear if this is still working
     public async addNewColumn(
         datasourceName: string,
         columnName: string,

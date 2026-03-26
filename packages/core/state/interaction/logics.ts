@@ -40,6 +40,14 @@ import {
     editFiles,
     DELETE_METADATA,
     DeleteMetadataAction,
+    SET_ORIGIN_FOR_PROVENANCE,
+    SetOriginForProvenance,
+    expandGraph,
+    ExpandGraph,
+    refreshGraph,
+    EXPAND_GRAPH,
+    setIsGraphLoading,
+    setIsRemoteFileUploadServerAvailable,
 } from "./actions";
 import * as interactionSelectors from "./selectors";
 import { ModalType } from "../../components/Modal";
@@ -57,8 +65,21 @@ import {
 } from "../../services/ExecutionEnvService";
 import { DownloadResolution, FileInfo } from "../../services/FileDownloadService";
 import { UserSelectedApplication } from "../../services/PersistentConfigService";
+import { fetchWithTimeout } from "../../hooks/useRemoteFileUpload";
 
 export const DEFAULT_QUERY_NAME = "New Query";
+
+/**
+ * Function for creating a message to display representing the total bytes to download
+ */
+const numberFormatter = annotationFormatterFactory(AnnotationType.NUMBER);
+function getBytesDisplay(bytes: number, hasUnknownSize = false): string {
+    const bytesWithUnits = numberFormatter.displayValue(bytes, "bytes");
+    if (hasUnknownSize) {
+        return `Unknown, but at least ${bytesWithUnits}`;
+    }
+    return bytesWithUnits;
+}
 
 /**
  * Interceptor responsible for checking if the user is able to access the AICS network
@@ -69,6 +90,9 @@ const initializeApp = createLogic({
         const queries = selection.selectors.getQueries(deps.getState());
         const isOnWeb = interactionSelectors.isOnWeb(deps.getState());
         const fileService = interactionSelectors.getHttpFileService(deps.getState());
+        const remoteUploadBaseUrl = interactionSelectors.getTemporaryFileServiceBaseUrl(
+            deps.getState()
+        );
 
         // Rudimentary check to see if the user is an AICS employee by
         // checking if the AICS network is accessible
@@ -112,10 +136,41 @@ const initializeApp = createLogic({
                 })
             );
         }
-
         dispatch(setIsAicsEmployee(isAicsEmployee) as AnyAction);
+
+        let isRemoteServerAvailable = false;
+        if (isAicsEmployee) {
+            const checkRemoteServer = async (): Promise<boolean> => {
+                const maxFetchAttempts = 3;
+                let lastError: Error | undefined;
+                let attempt = 1;
+                while (attempt <= maxFetchAttempts) {
+                    attempt++;
+                    try {
+                        const response = await fetchWithTimeout(`${remoteUploadBaseUrl}/ping`);
+                        if (response.ok) {
+                            return true;
+                        }
+                    } catch (error) {
+                        lastError = error as Error;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) & 500));
+                }
+
+                console.warn(
+                    `Could not connect to remote file upload server after ${maxFetchAttempts} attempts. Certain viewer integrations may be disabled.`,
+                    lastError
+                );
+                return false;
+            };
+
+            isRemoteServerAvailable = await checkRemoteServer();
+        }
+
+        dispatch(setIsRemoteFileUploadServerAvailable(isRemoteServerAvailable));
         done();
     },
+    warnTimeout: 0, // pinging remote server can take a while
 });
 
 /**
@@ -230,13 +285,12 @@ const downloadFilesLogic = createLogic({
     type: DOWNLOAD_FILES,
     warnTimeout: 0, // no way to know how long this will take--don't print console warning if it takes a while
     async process(deps: ReduxLogicDeps, dispatch, done) {
+        const { payload: files } = deps.action as DownloadFilesAction;
         const fileSelection = selection.selectors.getFileSelection(deps.getState());
+        const s3StorageService = interactionSelectors.getS3StorageService(deps.getState());
         const { fileDownloadService } = interactionSelectors.getPlatformDependentServices(
             deps.getState()
         );
-
-        const numberFormatter = annotationFormatterFactory(AnnotationType.NUMBER);
-        const { payload: files } = deps.action as DownloadFilesAction;
 
         let filesToDownload: FileInfo[];
         if (files !== undefined) {
@@ -254,64 +308,36 @@ const downloadFilesLogic = createLogic({
             }));
         }
 
+        let someFilesHaveUnknownSize = false;
         await Promise.all(
             filesToDownload.map(async (file) => {
-                const isStandardS3Url = file.path.includes("amazonaws.com");
-                // Handle S3 zarr files
-                if (file.path.endsWith(".zarr")) {
-                    if (!isStandardS3Url) {
-                        // Only check for virtualized URLs if not already an S3 URL
-                        const canUseDirectoryArgs = await fileDownloadService.canUseDirectoryArguments(
-                            file.path
-                        );
-                        if (!canUseDirectoryArgs) return; // Can't calculate size
-                    }
-                    const parsingFunc = isStandardS3Url
-                        ? fileDownloadService.parseS3Url
-                        : fileDownloadService.parseVirtualizedUrl;
-                    try {
-                        const { hostname, key, bucket } = parsingFunc(file.path);
-                        file.size = await fileDownloadService.calculateS3DirectorySize(
-                            hostname,
-                            key,
-                            bucket
-                        );
-                    } catch (err) {
-                        console.error(
-                            `Failed to calculate directory size for ${file.name}: ${err}`
-                        );
-                    }
-                } else if (file.size === 0 && isStandardS3Url) {
-                    // Handle individual S3 files
-                    try {
-                        file.size = await fileDownloadService.getHttpObjectSize(file.path);
-                    } catch (err) {
-                        console.error(`Failed to fetch file size for ${file.name}: ${err}`);
-                    }
+                if (!file.size) {
+                    file.size = await s3StorageService.getCloudObjectSize(file.path);
+                    if (file.size === undefined) someFilesHaveUnknownSize = true;
                 }
             })
         );
 
-        // Calculate total bytes to download
+        // Calculate total bytes to download if we know the total bytes
         const totalBytesToDownload = sumBy(filesToDownload, "size") || 0;
-        const totalBytesDisplay = numberFormatter.displayValue(totalBytesToDownload, "bytes");
+        const totalBytesDisplay = getBytesDisplay(totalBytesToDownload, someFilesHaveUnknownSize);
 
-        await Promise.all(
+        // TODO: Download these into a zip using new streamsaver zipped code
+        await Promise.allSettled(
             filesToDownload.map(async (file) => {
+                let isCancelled = false;
                 const downloadRequestId = uniqueId();
-                // TODO: The byte display should be fixed automatically when moving to downloading using browser
-                // https://github.com/AllenInstitute/biofile-finder/issues/62
-                const fileByteDisplay = numberFormatter.displayValue(file.size || 0, "bytes");
 
-                let totalBytesDownloaded = 0;
-                // A function that dispatches progress events, throttled
-                // to only be invokable at most once/second
                 const onCancel = () => {
+                    isCancelled = true;
                     dispatch(cancelFileDownload(downloadRequestId));
                 };
 
-                // Throttled progress dispatcher with updated message
+                // A function that dispatches progress events, throttled
+                // to only be invokable at most once/second
+                let totalBytesDownloaded = 0;
                 const throttledProgressDispatcher = throttle((progressMsg: string) => {
+                    if (isCancelled) return;
                     dispatch(
                         processProgress(
                             downloadRequestId,
@@ -337,8 +363,9 @@ const downloadFilesLogic = createLogic({
 
                 try {
                     // Start the download and handle progress reporting
-                    const msg = `Downloading ${file.name}. <br/> ${fileByteDisplay} out of ${totalBytesDisplay} set to download`;
-                    if (totalBytesToDownload) {
+                    if (!someFilesHaveUnknownSize) {
+                        const fileByteDisplay = getBytesDisplay(file.size || 0);
+                        const msg = `Downloading ${file.name}. <br/> ${fileByteDisplay} out of ${totalBytesDisplay} set to download`;
                         dispatch(processStart(downloadRequestId, msg, onCancel, [file.id]));
                     }
 
@@ -348,9 +375,9 @@ const downloadFilesLogic = createLogic({
                         onProgress
                     );
 
-                    if (totalBytesToDownload) {
+                    if (!someFilesHaveUnknownSize) {
                         if (result.resolution === DownloadResolution.CANCELLED) {
-                            dispatch(removeStatus(downloadRequestId));
+                            onCancel();
                         } else {
                             // This gets sent before some large files are complete
                             dispatch(
@@ -558,7 +585,6 @@ const openWithLogic = createLogic({
 const deleteMetadataLogic = createLogic({
     async process(deps: ReduxLogicDeps, dispatch, done) {
         const filters = interactionSelectors.getFileFiltersForVisibleModal(deps.getState());
-        const deleteRequestId = uniqueId();
         const {
             payload: { annotationName, user },
         } = deps.action as DeleteMetadataAction;
@@ -570,7 +596,7 @@ const deleteMetadataLogic = createLogic({
             const errorMsg = `Failed to delete metadata from files, some may have been edited. Details:<br/>${
                 err instanceof Error ? err.message : err
             }`;
-            dispatch(processError(deleteRequestId, errorMsg));
+            dispatch(processError(uniqueId(), errorMsg));
         } finally {
             done();
         }
@@ -725,6 +751,56 @@ const refresh = createLogic({
 });
 
 /**
+ * Interceptor responsible for processing relationship graph origin
+ * changes and updating the graph accordingly
+ */
+const setOriginForProvenance = createLogic({
+    process(deps: ReduxLogicDeps, dispatch, done) {
+        const { payload: file } = deps.action as SetOriginForProvenance;
+        const graph = interactionSelectors.getGraph(deps.getState());
+        if (!file) {
+            graph.reset();
+            dispatch(refreshGraph());
+        } else {
+            dispatch(expandGraph(file));
+        }
+        done();
+    },
+    type: SET_ORIGIN_FOR_PROVENANCE,
+});
+
+/**
+ * Interceptor responsible for processing a graph's expansion by
+ * focusing on a file as the origin of the relationships
+ */
+const expandGraphLogic = createLogic({
+    async process(deps: ReduxLogicDeps, dispatch, done) {
+        const { payload: file } = deps.action as ExpandGraph;
+        const graph = interactionSelectors.getGraph(deps.getState());
+        try {
+            try {
+                await graph.originate(file);
+                dispatch(refreshGraph());
+            } catch (err) {
+                dispatch(setIsGraphLoading(false));
+                dispatch(
+                    processError(
+                        uniqueId(),
+                        `Error while attempting to generate provenance graph for file ${
+                            file.name
+                        }. Error: ${(err as Error).message}`
+                    )
+                );
+            }
+        } finally {
+            done();
+        }
+    },
+    type: EXPAND_GRAPH,
+    warnTimeout: 0, // can take a long time for large datasets
+});
+
+/**
  * Interceptor responsible for processing screen size changes and
  * dispatching appropriate modal changes
  */
@@ -871,11 +947,13 @@ export default [
     downloadFilesLogic,
     downloadManifest,
     editFilesLogic,
+    expandGraphLogic,
     initializeApp,
     openWithDefault,
     openWithLogic,
     promptForNewExecutable,
     refresh,
     setIsSmallScreen,
+    setOriginForProvenance,
     showContextMenu,
 ];

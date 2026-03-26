@@ -1,6 +1,6 @@
-import { parseS3Url, isS3Url } from "amazon-s3-url";
-import axios from "axios";
 import HttpServiceBase, { ConnectionConfig } from "../HttpServiceBase";
+import S3StorageService from "../S3StorageService";
+import S3StorageServiceNoop from "../S3StorageService/S3StorageServiceNoop";
 
 export enum DownloadResolution {
     CANCELLED = "CANCELLED",
@@ -21,17 +21,31 @@ export interface FileInfo {
     data?: Uint8Array | Blob | string;
 }
 
+// Maps active request ids (uuids) to request download info
+interface ActiveRequestMap {
+    [id: string]: {
+        filePath?: string;
+        cancel: () => void;
+        onProgress?: (bytes: number) => void;
+    };
+}
+
+/**
+ * Abstract class for interfacing with file downloads
+ */
 export default abstract class FileDownloadService extends HttpServiceBase {
-    constructor(config: ConnectionConfig = {}) {
-        super({ ...config, includeCustomHeaders: false });
-    }
-
     abstract isFileSystemAccessible: boolean;
+    protected readonly activeRequestMap: ActiveRequestMap = {};
+    protected readonly cancellationRequests: Set<string> = new Set();
+    protected readonly s3StorageService: S3StorageService;
 
-    /**
-     * Attempt to cancel an active download request, deleting the downloaded artifact if present.
-     */
-    abstract cancelActiveRequest(downloadRequestId: string): void;
+    constructor(
+        s3StorageService: S3StorageService = new S3StorageServiceNoop(),
+        config: ConnectionConfig = {}
+    ) {
+        super({ ...config, includeCustomHeaders: false });
+        this.s3StorageService = s3StorageService;
+    }
 
     /**
      * Download a file described by `fileInfo`. Optionally provide an "onProgress" callback that will be
@@ -57,142 +71,15 @@ export default abstract class FileDownloadService extends HttpServiceBase {
     }
 
     /**
-     * Return true if s3 file.
+     * Attempt to cancel an active download request, deleting the downloaded artifact if possible
      */
-    public isS3Url(url: string): boolean {
-        try {
-            return isS3Url(url);
-        } catch (error) {
-            return false;
-        }
-    }
+    public cancelActiveRequest(downloadRequestId: string): void {
+        this.cancellationRequests.add(downloadRequestId);
 
-    /**
-     * Break down S3 URL to host, bucket, and path (key).
-     */
-    public parseS3Url(url: string): { hostname: string; bucket: string; key: string } {
-        const { protocol, hostname } = new URL(url);
-        const { region, bucket, key } = parseS3Url(url);
-        let parsedHost = hostname;
-        // CORS does not work with s3: protocol urls, so convert to a standard http host
-        if (protocol === "s3:") {
-            parsedHost = `s3.${region ? `${region}.` : ""}amazonaws.com`;
-        } else if (bucket && hostname.startsWith(bucket)) {
-            parsedHost = hostname.slice(bucket.length + 1);
-        }
-        return { hostname: parsedHost, bucket, key };
-    }
-
-    /**
-     * Parse a potentially virtualized S3 URL that would not be identifiable by parseS3Url
-     */
-    public parseVirtualizedUrl(url: string): { hostname: string; bucket: string; key: string } {
-        const urlObj = new URL(url);
-        const hostname = urlObj.hostname;
-        const key = urlObj.pathname.startsWith("/") ? urlObj.pathname.slice(1) : urlObj.pathname;
-        return { hostname, bucket: "", key };
-    }
-
-    /**
-     * List components of S3 directory.
-     */
-    public async listS3Objects(
-        hostname: string,
-        prefix: string,
-        bucket: string
-    ): Promise<string[]> {
-        const url = `https://${hostname}/${bucket}?list-type=2&prefix=${encodeURIComponent(
-            prefix
-        )}`;
-        const response = await this.httpClient.get(url);
-        const parser = new DOMParser();
-        const xmlDoc = parser.parseFromString(response.data, "text/xml");
-
-        const keys: string[] = [];
-        const contents = xmlDoc.getElementsByTagName("Key");
-
-        for (let i = 0; i < contents.length; i++) {
-            keys.push(contents[i].textContent || "");
-        }
-
-        return keys;
-    }
-
-    /**
-     * Not all S3 URLs are identifiable from their structure (e.g. some virtualized URLs),
-     * but we may still be able to support zarr downloads if the bucket accepts directory list arguments
-     *
-     * If the get call throws an error, return false
-     */
-    public async canUseDirectoryArguments(url: string): Promise<boolean> {
-        const { hostname, key } = this.parseVirtualizedUrl(url);
-        const directoryUrl = `https://${hostname}?list-type=2&prefix=${encodeURIComponent(key)}`;
-        try {
-            await this.httpClient.get(directoryUrl);
-            return true;
-        } catch (error) {
-            return false;
-        }
-    }
-
-    /**
-     * Calculate the total size of all files in an S3 directory (or zarr file).
-     */
-    public async calculateS3DirectorySize(
-        hostname: string,
-        prefix: string,
-        bucket: string
-    ): Promise<number> {
-        let totalSize = 0;
-        let continuationToken: string | undefined = undefined;
-
-        const url = `https://${hostname}/${bucket}?list-type=2&prefix=${encodeURIComponent(
-            prefix
-        )}`;
-
-        do {
-            const listUrl = continuationToken
-                ? `${url}&continuation-token=${encodeURIComponent(continuationToken)}`
-                : url;
-
-            try {
-                const response = await this.httpClient.get(listUrl);
-                const parser = new DOMParser();
-                const xmlDoc = parser.parseFromString(response.data, "text/xml");
-                const nextToken = xmlDoc.getElementsByTagName("NextContinuationToken")[0];
-                continuationToken = nextToken ? nextToken.textContent || undefined : undefined;
-
-                const contents = xmlDoc.getElementsByTagName("Contents");
-                for (let i = 0; i < contents.length; i++) {
-                    const key = contents[i].getElementsByTagName("Key")[0]?.textContent || "";
-                    const size = contents[i].getElementsByTagName("Size")[0]?.textContent || "0";
-
-                    // Skip directory placeholders (keys ending with '/')
-                    if (!key.endsWith("/")) {
-                        totalSize += parseInt(size, 10);
-                    }
-                }
-            } catch (err) {
-                console.error(`Failed to list objects in S3 directory: ${err}`);
-                throw err;
-            }
-        } while (continuationToken);
-
-        return totalSize;
-    }
-
-    /**
-     * Attempt to retrieve file size from an http object using a HEAD request.
-     *
-     * Returns bytes (octet)
-     */
-    public async getHttpObjectSize(url: string): Promise<number> {
-        try {
-            const response = await axios.head(url);
-            return parseInt(response.headers["content-length"] || "0", 10);
-        } catch (err) {
-            console.error(`Failed to get file size (content-length): ${err}`);
-            throw err;
+        if (this.activeRequestMap[downloadRequestId]) {
+            const { cancel } = this.activeRequestMap[downloadRequestId];
+            cancel();
+            delete this.activeRequestMap[downloadRequestId];
         }
     }
 }
@@ -202,8 +89,3 @@ export default abstract class FileDownloadService extends HttpServiceBase {
  */
 export const FileDownloadCancellationToken =
     "FMS_EXPLORER_EXECUTABLE_FILE_DOWNLOAD_CANCELLATION_TOKEN";
-
-/**
- * Maximum size of multifile cloud files that can be downloaded from a browser ~2GB
- */
-export const MAX_DOWNLOAD_SIZE_WEB = 2 * 1024 * 1024 * 1024;

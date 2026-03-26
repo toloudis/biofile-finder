@@ -8,6 +8,7 @@ import NumericRange from "../../../../entity/NumericRange";
 import SQLBuilder from "../../../../entity/SQLBuilder";
 import DatabaseServiceNoop from "../../../DatabaseService/DatabaseServiceNoop";
 import FileDownloadServiceNoop from "../../../FileDownloadService/FileDownloadServiceNoop";
+import { HIDDEN_UID_ANNOTATION } from "../../../../constants";
 
 import DatabaseFileService from "..";
 
@@ -15,7 +16,7 @@ describe("DatabaseFileService", () => {
     const totalFileSize = 864452;
     const fileIds = ["abc123", "def456"];
     const files = fileIds.map((file_id) => ({
-        [DatabaseService.HIDDEN_UID_ANNOTATION]: file_id,
+        [HIDDEN_UID_ANNOTATION]: file_id,
         "File Size": `${totalFileSize / 2}`,
         "File Path": "path/to/file",
         "File Name": "file",
@@ -23,13 +24,19 @@ describe("DatabaseFileService", () => {
     }));
 
     class MockDatabaseService extends DatabaseServiceNoop {
-        public query(): Promise<{ [key: string]: string }[]> {
-            return Promise.resolve(files);
+        protected readonly existingDataSources = new Set(["MockDataSource"]);
+        public query(): { promise: Promise<{ [key: string]: string }[]> } {
+            return { promise: Promise.resolve(files) };
         }
     }
     const databaseService = new MockDatabaseService();
 
     describe("getFiles", () => {
+        const sandbox = createSandbox();
+        afterEach(() => {
+            sandbox.restore();
+        });
+
         it("issues request for files that match given parameters", async () => {
             const databaseFileService = new DatabaseFileService({
                 dataSourceNames: ["whatever", "and another"],
@@ -65,6 +72,40 @@ describe("DatabaseFileService", () => {
                 ],
             });
         });
+
+        it("sorts parquets by hidden_bff_uid when offset is used", async () => {
+            // Arrange
+            const parquetFiles = [
+                {
+                    [HIDDEN_UID_ANNOTATION]: "1",
+                    "File ID": "123",
+                },
+            ];
+            class MockParquetDatabaseService extends DatabaseServiceNoop {
+                protected readonly existingDataSources = new Set(["parquet_source"]);
+                public query(_sql?: string): { promise: Promise<{ [key: string]: string }[]> } {
+                    return { promise: Promise.resolve(parquetFiles) };
+                }
+            }
+            const mockDbService = new MockParquetDatabaseService();
+            const querySpy = sandbox.spy(mockDbService, "query");
+
+            const databaseFileService = new DatabaseFileService({
+                dataSourceNames: ["parquet_source"],
+                databaseService: mockDbService,
+                downloadService: new FileDownloadServiceNoop(),
+            });
+            // Act
+            await databaseFileService.getFiles({
+                // This is a regression test. OFFSET 0 was a specific edge case
+                from: 0,
+                limit: 10,
+                fileSet: new FileSet(),
+            });
+
+            // Assert
+            expect(querySpy.calledWith(match(/ORDER BY\s+hidden_bff_uid/i))).to.be.true;
+        });
     });
 
     describe("getAggregateInformation", () => {
@@ -93,7 +134,7 @@ describe("DatabaseFileService", () => {
     describe("getCountOfMatchingFiles", () => {
         it("issues request for count of files matching given parameters", async () => {
             const fileService = new DatabaseFileService({
-                dataSourceNames: ["whatever"],
+                dataSourceNames: ["MockDataSource"],
                 databaseService,
                 downloadService: new FileDownloadServiceNoop(),
             });
@@ -198,7 +239,7 @@ describe("DatabaseFileService", () => {
     });
 
     describe("editFiles", () => {
-        const uidField = DatabaseService.HIDDEN_UID_ANNOTATION;
+        const uidField = HIDDEN_UID_ANNOTATION;
         const fileUid = "a1b2c3d4";
         const sandbox = createSandbox();
         afterEach(() => {
@@ -214,8 +255,8 @@ describe("DatabaseFileService", () => {
                 return Promise.reject("MockDatabaseEditService:saveQuery");
             }
 
-            public query(): Promise<{ [key: string]: string }[]> {
-                return Promise.reject("MockDatabaseEditService:query");
+            public query(): { promise: Promise<{ [key: string]: string }[]> } {
+                return { promise: Promise.reject("MockDatabaseEditService:query") };
             }
 
             protected addDataSource(): Promise<void> {
@@ -303,6 +344,51 @@ describe("DatabaseFileService", () => {
             expect(sqlSpy.called).to.be.true;
             const regex = new RegExp(String.raw`SET \"${annotationName}\" \= NULL`);
             expect(sqlSpy.calledWith(match(regex))).to.be.true;
+        });
+    });
+
+    describe("getManifest", () => {
+        const sandbox = createSandbox();
+        afterEach(() => {
+            sandbox.restore();
+        });
+
+        it("uses hidden_bff_uid to select files", async () => {
+            // Arrange
+            class MockParquetManifestService extends DatabaseServiceNoop {
+                protected readonly existingDataSources = new Set(["parquet_source"]);
+                public saveQuery(
+                    _destination?: string,
+                    _sql?: string,
+                    _format?: string
+                ): Promise<Uint8Array> {
+                    return Promise.resolve(new Uint8Array());
+                }
+            }
+            const mockDbService = new MockParquetManifestService();
+            const saveQuerySpy = sandbox.spy(mockDbService, "saveQuery");
+
+            const databaseFileService = new DatabaseFileService({
+                dataSourceNames: ["parquet_source"],
+                databaseService: mockDbService,
+                downloadService: new FileDownloadServiceNoop(),
+            });
+
+            const selections = [
+                {
+                    indexRanges: [{ start: 5, end: 7 }],
+                    filters: {},
+                    sort: undefined,
+                },
+            ];
+
+            // Act
+            await databaseFileService.getManifest(["File ID"], selections, "csv");
+
+            // Assert
+            const any = match(/.*/);
+            expect(saveQuerySpy.calledWith(any, match(/hidden_bff_uid\s+IN\s*\(/i), any)).to.be
+                .true;
         });
     });
 });

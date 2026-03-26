@@ -40,6 +40,9 @@ import {
     CHANGE_SOURCE_METADATA,
     ChangeSourceMetadataAction,
     changeSourceMetadata,
+    CHANGE_PROVENANCE_SOURCE,
+    ChangeProvenanceSource,
+    changeProvenanceSource,
     setRequiresDataSourceReload,
     addDataSourceReloadError,
     removeDataSourceReloadError,
@@ -428,10 +431,10 @@ const decodeSearchParamsLogics = createLogic({
             sortColumn,
             sources,
             sourceMetadata,
+            prov,
         } = SearchParams.decode(encodedURL);
 
         batch(() => {
-            dispatch(changeSourceMetadata(sourceMetadata));
             dispatch(changeDataSources(sources));
             dispatch(setAnnotationHierarchy(hierarchy));
             columns && dispatch(setColumns(columns));
@@ -440,6 +443,10 @@ const decodeSearchParamsLogics = createLogic({
             dispatch(setOpenFileFolders(openFolders));
             dispatch(setSortColumn(sortColumn));
             dispatch(toggleNullValueGroups(showNoValueGroups) as AnyAction);
+        });
+        batch(() => {
+            dispatch(changeSourceMetadata(sourceMetadata));
+            dispatch(changeProvenanceSource(prov));
         });
         done();
     },
@@ -644,6 +651,36 @@ const changeSourceMetadataLogic = createLogic({
 });
 
 /**
+ * Interceptor responsible for passing the CHANGE_PROVENANCE_SOURCE action to the database service.
+ */
+const changeProvenanceSourceLogic = createLogic({
+    type: CHANGE_PROVENANCE_SOURCE,
+    async process(deps: ReduxLogicDeps, dispatch, done) {
+        const { payload: selectedSourceProvenance } = deps.action as ChangeProvenanceSource;
+        const { databaseService } = interaction.selectors.getPlatformDependentServices(
+            deps.getState()
+        );
+
+        try {
+            if (selectedSourceProvenance) {
+                const edgeDefinitions = await databaseService.processProvenance(
+                    selectedSourceProvenance
+                );
+                dispatch(metadata.actions.receiveEdgeDefinitions(edgeDefinitions));
+            } else {
+                await databaseService.deleteSourceProvenance();
+                dispatch(metadata.actions.receiveEdgeDefinitions([]));
+            }
+        } catch (err) {
+            const msg = `Failed processing provenance. Error: ${(err as Error).message}`;
+            dispatch(interaction.actions.processError("provenanceIngestionError", msg));
+        }
+
+        done();
+    },
+});
+
+/**
  * Interceptor responsible for processing the added query to accurate/unique names
  */
 const addQueryLogic = createLogic({
@@ -679,24 +716,27 @@ const addQueryLogic = createLogic({
     transform(deps: ReduxLogicDeps, next) {
         const queries = selectionSelectors.getQueries(deps.getState());
         const { payload: newQuery } = deps.action as AddQuery;
-        // Map the query names to their occurrences so that queries with the same name
-        // have their occurences appended to their name to make them unique
-        const queryNameToOccurrence = queries.reduce(
-            (acc, query) => {
-                const nameWithoutOccurence = query.name.replace(/ \(\d+\)$/, "");
-                return { ...acc, [nameWithoutOccurence]: (acc[nameWithoutOccurence] || 0) + 1 };
-            },
-            {} as Record<string, number>
-        );
 
-        const newQueryName = newQuery.name.replace(/ \(\d+\)$/, "");
+        // Make sure query name is unique.
+        // Can't just use index/number of queries with the same name,
+        // because these may collide or not line up if the user has deleted previous occurrences.
+        // Instead, iterate through a counter until we find an unused query name
+        let counter = 0;
+        const nameWithoutCounter = newQuery.name.replace(/ \(\d+\)$/, "");
+        let newQueryName = nameWithoutCounter;
+        function queryNameAlreadyExists(queryName: string): boolean {
+            return queries.some((query) => query.name === queryName);
+        }
+        while (queryNameAlreadyExists(newQueryName)) {
+            counter++;
+            newQueryName = `${nameWithoutCounter} (${counter})`;
+        }
+
         next({
             ...deps.action,
             payload: {
                 ...newQuery,
-                name: queryNameToOccurrence[newQueryName]
-                    ? `${newQueryName} (${queryNameToOccurrence[newQueryName]})`
-                    : newQueryName,
+                name: newQueryName,
             },
         });
     },
@@ -844,6 +884,7 @@ export default [
     setAvailableAnnotationsLogic,
     changeDataSourceLogic,
     changeSourceMetadataLogic,
+    changeProvenanceSourceLogic,
     addQueryLogic,
     replaceDataSourceLogic,
     setDataSourceReloadErrorLogic,

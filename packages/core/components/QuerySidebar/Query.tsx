@@ -222,6 +222,7 @@ export default function Query(props: QueryProps) {
             <QueryDataSource
                 dataSources={queryComponents.sources}
                 sourceMetadata={queryComponents.sourceMetadata}
+                sourceProvenance={queryComponents.prov}
             />
             <QueryGroup disabled={!hasDataSource} groups={queryComponents.hierarchy} />
             <QueryFilter disabled={!hasDataSource} filters={queryComponents.filters} />
@@ -230,8 +231,7 @@ export default function Query(props: QueryProps) {
                 isDeletable={queries.length > 1}
                 onQueryDelete={onQueryDelete}
                 query={props.query}
-                groups={queryComponents.hierarchy}
-                filters={queryComponents.filters}
+                queryComponents={queryComponents}
             />
         </div>
     );
